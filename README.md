@@ -1,35 +1,72 @@
-# Claude Clawd Status - Hook Animation Mapping
+# Claude Clawd Status
 
-This skill maps Claude Code hook events to Clawd Mochi Tank animations.
+Claude Code status bridge for the Clawd Mochi Tank ESP32 display.
 
-## Lifecycle
+Full install, usage, Hub, transport, hook, and troubleshooting documentation lives in:
 
-| Moment | Animation |
-| --- | --- |
-| `SessionStart` | `idle` |
-| `UserPromptSubmit` | `thinking` |
-| `PreToolUse` | tool-specific animation or `confused` when approval is needed |
-| `PostToolUse` | tool-specific animation |
-| `PreCompact` | `sweeping` |
-| `Stop` | `happy` -> `idle` -> `sleeping` |
-| `StopFailure` | `dizzy` |
-| `SessionEnd` | `going_away` |
-| `SubagentStart` | `conducting` |
-| `SubagentStop` | `thinking` |
-
-## Transport Configuration
-
-Default priority is BLE GATT, then auto-detected CH340/CH341 USB serial, then HTTP `192.168.4.1`.
-
-```powershell
-$env:CLAWD_TANK_TRANSPORT = "ble"
-$env:CLAWD_DEBUG = "1"
+```text
+SKILL.md
 ```
 
-Use `CLAWD_TANK_TRANSPORT=serial` only when you want USB serial; the hook discovers the CH340 port from pyserial metadata. `CLAWD_TANK_SERIAL_PORT` is only an override.
+## Runtime Flow
+
+```text
+Claude Code hooks
+  -> claude_clawd_hook.py
+  -> Hook Hub at http://127.0.0.1:8765
+  -> BLE / CH340 serial / HTTP
+  -> ESP32
+```
+
+## Install
 
 ```powershell
-python scripts/claude_clawd_hook.py --doctor
-python scripts/claude_clawd_hook.py --test typing --transport ble
-python scripts/claude_clawd_hook.py --print-mapping
+C:\Python314\python.exe C:\Users\admin\.claude\skills\claude-clawd-status\scripts\install_hooks.py
 ```
+
+Then restart Claude Code so hook settings are reloaded.
+
+## Daily Start
+
+Start the shared Hub:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.claude\skills\claude-clawd-status\scripts\clawd_status_hub.py",
+    "--transport", "auto"
+  ) `
+  -WindowStyle Hidden
+```
+
+Open:
+
+```text
+http://127.0.0.1:8765
+```
+
+If Codex already started the Hub on port `8765`, reuse that same Hub.
+
+## Client IDs
+
+```text
+claude-code     Claude Code hook events
+manual          Hub dashboard buttons
+```
+
+When sharing the Hub with Codex, the same page may also show `codex-code`, `codex-vscode`, and `codex-desktop`.
+
+## Test
+
+```powershell
+C:\Python314\python.exe C:\Users\admin\.claude\skills\claude-clawd-status\scripts\claude_clawd_hook.py --doctor
+C:\Python314\python.exe C:\Users\admin\.claude\skills\claude-clawd-status\scripts\claude_clawd_hook.py --test thinking
+Invoke-RestMethod http://127.0.0.1:8765/state
+```
+
+## Notes
+
+- Default transport is `auto`: BLE, then auto-detected CH340/CH341 serial, then HTTP.
+- Serial ports are not fixed; CH340/CH341 is detected from port metadata.
+- Hub localhost requests bypass system proxy settings.
+- Detailed behavior and troubleshooting are in `SKILL.md`.

@@ -29,6 +29,10 @@ BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 LOG_DIR = Path.home() / ".clawd-mochi"
 LOG_PATH = LOG_DIR / "status-hook.log"
 LAST_EVENT_PATH = LOG_DIR / "last_event"
+HUB_PID_PATH = LOG_DIR / "status-hub.pid"
+DEFAULT_HUB_URL = "http://127.0.0.1:8765"
+DEFAULT_CLIENT_ID = "claude-code"
+NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Delays for idle → sleeping auto-transition after Stop
 HAPPY_DURATION_S = 10
@@ -72,6 +76,167 @@ def read_last_event() -> float:
         return float(LAST_EVENT_PATH.read_text(encoding="utf-8").strip())
     except Exception:
         return 0.0
+
+
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2.0,
+                check=False,
+            )
+            return f'"{pid}"' in (result.stdout or "")
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_hub_pid() -> int:
+    try:
+        return int(HUB_PID_PATH.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def hub_url(cli_url: str | None = None) -> str:
+    return (cli_url or os.environ.get("CLAWD_TANK_HUB_URL") or DEFAULT_HUB_URL).rstrip("/")
+
+
+def hub_urlopen(req: str | urllib.request.Request, timeout: float):
+    return NO_PROXY_OPENER.open(req, timeout=timeout)
+
+
+def client_id(cli_client_id: str | None = None) -> str:
+    return (cli_client_id or os.environ.get("CLAWD_TANK_CLIENT_ID") or DEFAULT_CLIENT_ID).strip()
+
+
+def hub_enabled(args: argparse.Namespace | None = None) -> bool:
+    if args is not None and getattr(args, "no_hub", False):
+        return False
+    return os.environ.get("CLAWD_TANK_USE_HUB", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def hub_required(args: argparse.Namespace | None = None) -> bool:
+    if args is not None and getattr(args, "hub_required", False):
+        return True
+    return os.environ.get("CLAWD_TANK_HUB_REQUIRED", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def ping_hub(cli_url: str | None = None) -> bool:
+    try:
+        with hub_urlopen(hub_url(cli_url) + "/health", timeout=0.4) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def ensure_hub(args: argparse.Namespace) -> None:
+    if not hub_enabled(args) or ping_hub(args.hub_url):
+        return
+    pid = read_hub_pid()
+    if pid_is_running(pid):
+        return
+
+    hub = Path(__file__).with_name("clawd_status_hub.py")
+    if not hub.exists():
+        log(f"hub autostart skipped; missing {hub}")
+        return
+
+    cmd = [sys.executable, str(hub)]
+    if args.transport:
+        cmd += ["--transport", args.transport]
+    if args.port:
+        cmd += ["--serial-port", args.port]
+    if args.baud is not None:
+        cmd += ["--baud", str(args.baud)]
+    if args.ble_address:
+        cmd += ["--ble-address", args.ble_address]
+    if args.ble_name:
+        cmd += ["--ble-name", args.ble_name]
+
+    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        HUB_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
+        log(f"hub autostarted pid={proc.pid}")
+    except Exception as exc:
+        log(f"hub autostart failed: {exc}")
+        return
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if ping_hub(args.hub_url):
+            return
+        time.sleep(0.15)
+
+
+def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = None, event_time: float | None = None) -> bool:
+    ensure_hub(args)
+    event = (payload.get("hook_event_name") or payload.get("event")) if payload else ""
+    tool = (payload.get("tool_name") or payload.get("toolName")) if payload else ""
+    body = json.dumps(
+        {
+            "source": "claude",
+            "client_id": client_id(getattr(args, "client_id", None)),
+            "client_kind": "claude",
+            "anim": anim,
+            "event": event,
+            "tool": tool,
+            "payload": payload or {},
+            "event_time": event_time,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        hub_url(args.hub_url) + "/hook",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with hub_urlopen(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            ok = bool(data.get("ok"))
+            log(f"hub delivery anim={anim} ok={ok} status={data.get('status')}")
+            return ok
+    except Exception as exc:
+        log(f"hub delivery failed anim={anim}: {exc}")
+        return False
+
+
+def deliver_anim(anim: str, args: argparse.Namespace, payload: dict | None = None,
+                 event_time: float | None = None) -> bool:
+    if hub_enabled(args):
+        if send_anim_hub(anim, args, payload=payload, event_time=event_time):
+            return True
+        if hub_required(args):
+            return False
+    send_anim(
+        anim,
+        transport=args.transport,
+        port=args.port,
+        baud=args.baud,
+        ble_address=args.ble_address,
+        ble_name=args.ble_name,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -349,20 +514,30 @@ def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
 def run_timed_transition(event_time: float, transport: str | None, port: str | None,
                          baud: int | None, ble_address: str | None, ble_name: str | None) -> None:
     """Background: wait HAPPY_DURATION_S → idle, then IDLE_DURATION_S → sleeping."""
-    kw = dict(transport=transport, port=port, baud=baud, ble_address=ble_address, ble_name=ble_name)
+    args = argparse.Namespace(
+        transport=transport,
+        port=port,
+        baud=baud,
+        ble_address=ble_address,
+        ble_name=ble_name,
+        hub_url=None,
+        no_hub=False,
+        hub_required=False,
+        client_id=DEFAULT_CLIENT_ID,
+    )
 
     time.sleep(HAPPY_DURATION_S)
     if read_last_event() > event_time + 1.0:
         log(f"timed transition aborted (new activity)")
         return
-    send_anim("idle", **kw)
+    deliver_anim("idle", args, event_time=event_time)
     log("timed transition: happy → idle")
 
     time.sleep(IDLE_DURATION_S)
     if read_last_event() > event_time + 1.0:
         log(f"timed transition aborted (new activity during idle)")
         return
-    send_anim("sleeping", **kw)
+    deliver_anim("sleeping", args, event_time=event_time)
     log("timed transition: idle → sleeping")
 
 
@@ -453,6 +628,10 @@ def main() -> int:
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--ble-address")
     parser.add_argument("--ble-name", default=None)
+    parser.add_argument("--hub-url", default=None)
+    parser.add_argument("--no-hub", action="store_true", help="bypass local Clawd Hook Hub")
+    parser.add_argument("--hub-required", action="store_true", help="do not fall back to direct transports if hub fails")
+    parser.add_argument("--client-id", default=os.environ.get("CLAWD_TANK_CLIENT_ID", DEFAULT_CLIENT_ID))
     parser.add_argument("--timed-transition", type=float, default=None, metavar="EPOCH",
                         help="internal: run happy→idle→sleeping timer started at EPOCH")
     args = parser.parse_args()
@@ -475,14 +654,7 @@ def main() -> int:
         return 0
 
     if args.test:
-        send_anim(
-            args.test,
-            transport=args.transport,
-            port=args.port,
-            baud=args.baud,
-            ble_address=args.ble_address,
-            ble_name=args.ble_name,
-        )
+        deliver_anim(args.test, args)
         return 0
 
     payload = read_payload()
@@ -494,14 +666,7 @@ def main() -> int:
 
     anim = payload_to_anim(payload)
     if anim:
-        send_anim(
-            anim,
-            transport=args.transport,
-            port=args.port,
-            baud=args.baud,
-            ble_address=args.ble_address,
-            ble_name=args.ble_name,
-        )
+        deliver_anim(anim, args, payload=payload, event_time=event_time)
         # After Stop → happy, spawn background timer for idle then sleeping
         if anim == "happy":
             spawn_timed_transition(event_time, args)
